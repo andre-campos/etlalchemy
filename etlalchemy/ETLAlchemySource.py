@@ -50,9 +50,11 @@ class ETLAlchemySource():
                  skip_table_if_empty=False,
                  skip_column_if_empty=False,
                  compress_varchar=False,
-                 log_file=None):
+                 log_file=None,
+                 schema_name=None):
         # TODO: Store unique columns in here, and ADD the unique constraints
         # after data has been migrated, rather than before
+        self.schema_name = schema_name
         self.unique_columns = []
         self.compress_varchar = compress_varchar
         
@@ -400,6 +402,7 @@ class ETLAlchemySource():
             self.logger.info("Found column of type 'BIT' -> " +
                 "coercing to Boolean'")
             column_copy.type.__class__ = sqlalchemy.types.Boolean
+
         elif "TYPEENGINE" in base_classes:
             for r in raw_rows:
                 if r[idx] is not None:
@@ -876,13 +879,11 @@ class ETLAlchemySource():
             self,
             destination_database_url,
             migrate_data=True,
-            migrate_schema=True):
+            migrate_schema=True,
+            buffer_size=10000):
         """"""""""""""""""""""""
         """ ** REFLECTION ** """
         """"""""""""""""""""""""
-       
-        buffer_size = 10000
-
         if self.database_url.split(":")[0] == "oracle+cx_oracle":
             try:
                 self.engine = create_engine(
@@ -896,7 +897,8 @@ class ETLAlchemySource():
                 raise DBApiNotFound(self.database_url)
         # Create inspectors to gather schema info...
         self.src_insp = reflection.Inspector.from_engine(self.engine)
-        self.table_names = self.src_insp.get_table_names()
+        self.table_names = self.src_insp.get_table_names(schema=self.schema_name)
+
         try:
             self.dst_engine = create_engine(destination_database_url)
         except ImportError as e:
@@ -939,7 +941,7 @@ class ETLAlchemySource():
             auto_inc_count = 0
 
             t_start_extract = datetime.now()
-            T_src = Table(table_name, MetaData())
+            T_src = Table(table_name, MetaData(schema=self.schema_name))
             try:
                 self.src_insp.reflecttable(T_src, None)
             except NoSuchTableError as table:
@@ -998,85 +1000,6 @@ class ETLAlchemySource():
                         T_src.name))
                 
 
-                cnt = self.engine.execute(T_src.count()).fetchone()[0]
-                resultProxy = self.engine.execute(T_src.select())
-                self.logger.info("Done. ({0} total rows)".format(str(cnt)))
-                j = 0
-                self.logger.info("Loading all rows into memory...")
-                rows = []
-
-                for i in range(1, (cnt / buffer_size) + 1):
-                    self.logger.info(
-                        "Fetched {0} rows".format(str(i * buffer_size)))
-                    rows += resultProxy.fetchmany(buffer_size)
-                rows += resultProxy.fetchmany(cnt % buffer_size)
-                # Don't rely on Python garbage collection...
-                resultProxy.close()
-
-                assert(cnt == len(rows))
-
-                raw_rows = [list(row) for row in rows]
-                self.logger.info("Done")
-                pks = []
-
-                t_start_transform = datetime.now()
-
-                # TODO: Use column/table mappers, would need to update foreign
-                # keys...
-            
-                for column in T_src.columns:
-                    self.column_count += 1
-                    ##############################
-                    # Check for multiple primary
-                    #  keys & auto-increment
-                    ##############################
-                    if column.primary_key:
-                        pks.append(column.name.lower())
-                        pk_count += 1
-                    
-                    if column.autoincrement:
-                        auto_inc_count += 1
-                    ##############################
-                    # Standardize Column Type
-                    ##############################
-                    column_copy = self.standardize_column_type(column, raw_rows)
-                    """"""""""""""""""""""""""""""
-                    """ *** ELIMINATION I *** """
-                    """"""""""""""""""""""""""""""
-                    self.add_or_eliminate_column(
-                        T, T_dst_exists, column, column_copy, raw_rows)
-
-                if self.dst_engine.dialect.name.lower() == "mysql":
-                    #######################################
-                    # Remove auto-inc on composite PK's
-                    #######################################
-                    self.check_multiple_autoincrement_issue(
-                        auto_inc_count, pk_count, T)
-                if self.transform_table(T) is None:
-                    # Skip the table, it is scheduled to be deleted...
-                    continue
-                elif len(T.columns) == 0:
-                    # TODO: Delete table from T_dst
-                    self.logger.warning(
-                        "Table '" + T.name + "' has all NULL columns, " +
-                        "skipping...")
-                    self.empty_table_count += 1
-                    self.empty_tables.append(T.name)
-                    continue
-                elif len(raw_rows) == 0 and self.skip_table_if_empty:
-                    self.logger.warning(
-                        "Table '" + T.name + "' has 0 rows, skipping...")
-                    self.empty_table_count += 1
-                    self.empty_tables.append(T.name)
-                    continue
-                else:
-                    tableCreationSuccess = self.create_table(T_dst_exists, T)
-                    if not tableCreationSuccess:
-                        continue
-
-                """"""""""""""""""""""""""""""
-                """" *** INSERT ROWS *** """""
-                """"""""""""""""""""""""""""""
                 data_file_path = os.getcwd() + "/{0}.sql".format(T.name)
                 if os.path.isfile(data_file_path):
                     os.remove(data_file_path)
@@ -1086,100 +1009,98 @@ class ETLAlchemySource():
                 dst_meta.reflect(self.dst_engine)
 
                 #self.tgt_insp.reflecttable(T, None)
-                t_start_dump = datetime.now()
                 t_start_load = datetime.now()
+
+                cnt = self.engine.execute(T_src.count()).fetchone()[0]
+                resultProxy = self.engine.execute(T_src.select())
+                self.logger.info("Done. ({0} total rows)".format(str(cnt)))
+                j = 0
+                self.logger.info("Loading all rows into memory...")
+                rows = None
+                real_count = 0
                 
-                row_buffer_size = 100000
-                if self.dst_engine.dialect.name.lower() == 'mssql' and \
-                 not self.enable_mssql_bulk_insert:
-                    # MSSQL limits the amount of INSERTS per query
-                    row_buffer_size = 1000
+                for i in range(1, (cnt / buffer_size) + 2):
+                    self.logger.info(
+                        "Fetched {0} rows".format(str(i * buffer_size)))
+                    rows = resultProxy.fetchmany(buffer_size)
+                    raw_rows = [list(row) for row in rows]
+                    real_count += len(rows)
+                    if len(rows) == 0:
+                        continue
 
-                if migrate_data:
-                    self.logger.info("Transforming & Dumping " +
-                                     str(len(raw_rows)) +
-                                     " total rows from table '" +
-                                     str(T.name) +
-                                     "' into '{0}'.".format(data_file_path))
-                    # Create buffers of "100000" rows
-                    # TODO: Parameterize "100000" as 'buffer_size' (should be
-                    # configurable)
-                    insertionCount = (len(raw_rows) / row_buffer_size) + 1
-                    raw_row_len = len(raw_rows)
-                    self.total_rows += raw_row_len
-                    if len(raw_rows) > 0:
-                        for i in range(0, insertionCount):
-                            startRow = 0  # i * 1000
-                            endRow = row_buffer_size  # (i+1) * 1000
-                            virtualStartRow = i * row_buffer_size
-                            virtualEndRow = (i + 1) * row_buffer_size
-                            if virtualEndRow > raw_row_len:
-                                virtualEndRow = raw_row_len
-                                endRow = raw_row_len
-                            self.logger.info(
-                                " ({0}) -- Transforming rows: ".format(
-                                    T.name) +
-                                str(virtualStartRow) +
-                                " -> " +
-                                str(virtualEndRow) +
-                                "...({0} Total)".format(
-                                    str(raw_row_len)))
-                            self.transform_data(
-                                T_src, raw_rows[startRow:endRow])
-                            self.logger.info(
-                                " ({0}) -- Dumping rows: "
-                                .format(T.name) +
-                                str(virtualStartRow) +
-                                " -> " +
-                                str(virtualEndRow) +
-                                " to '{1}.sql'...({0} Total)"
-                                .format(str(raw_row_len), T.name) +
-                                "[Table {0}/{1}]".format(str(t_idx), str(t_total)))
-                            self.dump_data(
-                                T_dst_exists, T, raw_rows[startRow:endRow],
-                                pks, Session)
-                            del raw_rows[startRow:endRow]
+                    pks = []
 
-                        #######################################################
-                        # Now *actually* load the data via fast-CLI utilities
-                        #######################################################
-                        t_start_load = datetime.now()
-                        # From <table_name>.sql
-                        self.send_data(
-                            T.name, self.current_ordered_table_columns)
+                    # TODO: Use column/table mappers, would need to update foreign
+                    # keys...
+                    
+                    for column in T_src.columns:
+                        self.column_count += 1
+                        ##############################
+                        # Check for multiple primary
+                        #  keys & auto-increment
+                        ##############################
+                        if column.primary_key:
+                            pks.append(column.name.lower())
+                            pk_count += 1
+                        
+                        if column.autoincrement:
+                            auto_inc_count += 1
+                        ##############################
+                        # Standardize Column Type
+                        ##############################
+                        column_copy = self.standardize_column_type(column, raw_rows)
+                        """"""""""""""""""""""""""""""
+                        """ *** ELIMINATION I *** """
+                        """"""""""""""""""""""""""""""
+                        if i == 1:
+                            self.add_or_eliminate_column(
+                                T, T_dst_exists, column, column_copy, raw_rows)
 
-                t_stop_load = datetime.now()
+                    if self.dst_engine.dialect.name.lower() == "mysql":
+                        #######################################
+                        # Remove auto-inc on composite PK's
+                        #######################################
+                        if i == 1:
+                            self.check_multiple_autoincrement_issue(
+                                auto_inc_count, pk_count, T)
+                    if self.transform_table(T) is None:
+                        # Skip the table, it is scheduled to be deleted...
+                        continue
+                    elif len(T.columns) == 0:
+                        # TODO: Delete table from T_dst
+                        self.logger.warning(
+                            "Table '" + T.name + "' has all NULL columns, " +
+                            "skipping...")
+                        self.empty_table_count += 1
+                        self.empty_tables.append(T.name)
+                        continue
+                    elif len(raw_rows) == 0 and self.skip_table_if_empty:
+                        self.logger.warning(
+                            "Table '" + T.name + "' has 0 rows, skipping...")
+                        self.empty_table_count += 1
+                        self.empty_tables.append(T.name)
+                        continue
+                    elif i == 1:
+                        tableCreationSuccess = self.create_table(T_dst_exists, T)
+                        if not tableCreationSuccess:
+                            continue
 
-                ###################################
-                # Calculate operation time... ###
-                ###################################
+                    if migrate_data and len(raw_rows) > 0:
+                        self.transform_data(T_src, raw_rows)
+                        self.dump_data(T_dst_exists, T, raw_rows, pks, Session)
 
-                extraction_dt = t_start_transform - t_start_extract
-                extraction_dt_str = str(
-                    extraction_dt.seconds / 60) + "m:" + \
-                    str(extraction_dt.seconds % 60) + "s"
+                        
+                # Don't rely on Python garbage collection...
+                resultProxy.close()
+                self.logger.info('Actual count: {}'.format(real_count))
+                assert(cnt == real_count)
+                t_start_load = datetime.now()
+                if migrate_data and len(raw_rows) > 0:
+                    self.send_data(T.name, self.current_ordered_table_columns)
+                
+                self.logger.info("Done")
 
-                transform_dt = t_start_dump - t_start_transform
-                transform_dt_str = str(
-                    transform_dt.seconds / 60) + "m:" + \
-                    str(transform_dt.seconds % 60) + "s"
-
-                dump_dt = t_start_load - t_start_dump
-                dump_dt_str = str(dump_dt.seconds / 60) + \
-                    "m:" + str(dump_dt.seconds % 60) + "s"
-
-                load_dt = t_stop_load - t_start_load
-                load_dt_str = str(load_dt.seconds / 60) + \
-                    "m:" + str(load_dt.seconds % 60) + "s"
-
-                self.times[table_name][
-                    'Extraction Time (From Source)'] = extraction_dt_str
-                self.times[table_name][
-                    'Transform Time (Schema)'] = transform_dt_str
-                self.times[table_name][
-                    'Data Dump Time (To File)'] = dump_dt_str
-                self.times[table_name]['Load Time (Into Target)'] = load_dt_str
-                # End first table loop...
+            
 
     def add_indexes(self, destination_database_url):
         dst_meta = MetaData()
